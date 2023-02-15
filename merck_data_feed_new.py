@@ -14,7 +14,7 @@ from typing import List
 import pandas as pd
 import numpy as np
 
-from operators.ms_teams_webhook_hook import MSTeamsWebhookHook
+
 from modules.sampledsphere_db.session import SessionLocal
 from modules.sampledsphere_db.models import (
     Accessioning,
@@ -22,8 +22,7 @@ from modules.sampledsphere_db.models import (
     QualityControl,
     StatusUpdates,
 )
-from office365.runtime.auth.user_credential import UserCredential
-from office365.sharepoint.client_context import ClientContext
+
 from pytz import timezone
 from sqlalchemy import func, or_
 import shortuuid
