@@ -1,32 +1,22 @@
-# Naming Convention:
-# 1. BioTRACS_Merck_INV_Sampled_{YYYYMMDD_HHmmss}.csv (Multi-Project Upload)
-# 2. For fields missing data, leave the field blank. Do not populate with “N/A,” “Not Available,” or “Not Provided.”
-# 3. For numerical fields, do not populate null fields with a zero (0). Leave null.
-# 4. Date fields format should be MM/DD/YYYY.
-# 5. Text type fields have a maximum of 250 characters.
-# 6. See Appendix 2. for value mappings
-
+import argparse
 import json
 import os
+import pickle
 from datetime import datetime, timedelta
 from typing import List
 
-import pandas as pd
 import numpy as np
-
-
-from modules.sampledsphere_db.session import SessionLocal
-from modules.sampledsphere_db.models import (
-    Accessioning,
-    Aliquot,
-    QualityControl,
-    StatusUpdates,
-)
+import pandas as pd
 
 from pytz import timezone
 from sqlalchemy import func, or_
 import shortuuid
 import io
+
+from models.session import SessionLocal
+from models.accessioning import Accessioning, Aliquot, QualityControl, StatusUpdates
+
+from scripts.dependencies.table_columns import *
 
 pd.set_option("max_columns", None)  # Showing only two columns
 pd.set_option("max_rows", None)
@@ -36,7 +26,7 @@ pd.set_option("display.max_rows", None)
 
 db = SessionLocal()
 
-SHAREPOINT_URL = Variable.get("BIOSPHERE_SHAREPOINT_URL")
+
 BASESITE = Variable.get("BIOSPHERE_SHAREPOINT_BASESITE")
 USERNAME = Variable.get("BIOSPHERE_SHAREPOINT_USERNAME")
 PASSWORD = Variable.get("BIOSPHERE_SHAREPOINT_PASSWORD")
@@ -1063,10 +1053,7 @@ def run_ali_validation(aliquot):
     )
     miss_stat = aliquot[~aliquot["status"].isin(STATUS_MAP.keys())]
     if miss_stat.shape[0]:
-        raise AirflowException(
-            f"Incorrect Status (Aliquot): {' ,'.join(miss_stat['inventory_code'])}"
-        )
-    aliquot["status"] = aliquot["status"].replace(STATUS_MAP)
+        aliquot["status"] = aliquot["status"].replace(STATUS_MAP)
     return aliquot
 
 
