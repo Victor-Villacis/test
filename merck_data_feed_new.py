@@ -13,13 +13,7 @@ from typing import List
 
 import pandas as pd
 import numpy as np
-from airflow.contrib.hooks.ssh_hook import SSHHook
-from airflow.decorators import dag, task
-from airflow.exceptions import AirflowException
-from airflow.hooks.S3_hook import S3Hook
-from airflow.models import Variable
-from airflow.operators.python import get_current_context
-from airflow.utils.dates import days_ago
+
 from operators.ms_teams_webhook_hook import MSTeamsWebhookHook
 from modules.sampledsphere_db.session import SessionLocal
 from modules.sampledsphere_db.models import (
@@ -40,13 +34,6 @@ pd.set_option("max_rows", None)
 pd.set_option("display.max_columns", None)
 pd.set_option("display.max_rows", None)
 
-default_args = {
-    "owner": "airflow-api",
-    "email": ["alexander.bogdanowicz@infinity-biologix.com"],
-    "email_on_failure": True,
-    "retries": 0,
-    "retry_delay": timedelta(minutes=1),
-}
 
 db = SessionLocal()
 
@@ -1003,382 +990,334 @@ P3_STUDY = [
 # 6. There seem to be null values for volume_unit in LIMS along with vol_avg - How Should this be interpreted?
 
 
-@dag(
-    default_args=default_args,
-    start_date=days_ago(1),
-    catchup=False,
-    schedule_interval=None,
-    tags=["sampledsphere"],
-)
-def sphere_merck_data_feed_new():
-    # Step 1. Create the Mapping from Aliquot to
+def run_acc_validation(accessioning):
+    accessioning["origination_facility"] = (
+        accessioning["origination_facility"]
+        .replace(FACILITY_MAP)
+        .replace([np.nan], [None])
+    )
+    accessioning["analysis_type"] = accessioning["analysis_type"].replace(
+        ANALYSIS_MAPPING
+    )
+    accessioning["specimen_type"] = accessioning["source"].replace(SOURCE_MAPPING)
+    accessioning = accessioning[
+        ~(
+            (accessioning["container_type"].astype(str) == "Micronic 1.4")
+            & (accessioning["source"] == "WB")
+        )
+    ]
+    # accessioning = accessioning[~((accessioning["container_type"] == "Micronic 1.4") & (accessioning["source"] == "WB"))]
+    accessioning["specimen_type"] = accessioning.apply(
+        lambda x: SPECIMEN_MAPPING[x["container_type"].lower()]
+        if x["source"] == "WB"
+        else x["specimen_type"],
+        axis=1,
+    )
 
-    def send_data(file_name, data):
-        print("Sending Data to Biotracs")
-        s3_bucket = "biosphere-merck-sftp"
-        s3 = S3Hook(aws_conn_id="lims_biosphere_s3_conn")
-        key = f"biotracs/{file_name}"
-        check = s3.check_for_key(key=key, bucket_name=s3_bucket)
-        if check:
-            raise AirflowException(f"S3 Bucket already contains content: {file_name}")
-        try:
-            s3.load_string(data.to_csv(index=False), key=key, bucket_name=s3_bucket)
-        except:
-            raise AirflowException(f"Trouble Transfering File to Biotracs: {file_name}")
-
-    def run_acc_validation(accessioning):
-        accessioning["origination_facility"] = (
-            accessioning["origination_facility"]
-            .replace(FACILITY_MAP)
-            .replace([np.nan], [None])
-        )
-        accessioning["analysis_type"] = accessioning["analysis_type"].replace(
-            ANALYSIS_MAPPING
-        )
-        accessioning["specimen_type"] = accessioning["source"].replace(SOURCE_MAPPING)
-        accessioning = accessioning[
-            ~(
-                (accessioning["container_type"].astype(str) == "Micronic 1.4")
-                & (accessioning["source"] == "WB")
-            )
-        ]
-        # accessioning = accessioning[~((accessioning["container_type"] == "Micronic 1.4") & (accessioning["source"] == "WB"))]
-        accessioning["specimen_type"] = accessioning.apply(
-            lambda x: SPECIMEN_MAPPING[x["container_type"].lower()]
-            if x["source"] == "WB"
-            else x["specimen_type"],
-            axis=1,
-        )
-        # miss_at = accessioning[~accessioning["analysis_type"].isin(ANALYSIS_TYPES)]
-        # if miss_at.shape[0]:
-        #     raise AirflowException(f"Incorrect Analysis Type (Accessioning): {' ,'.join(miss_at['inventory_code'])}")
-        # miss_st = accessioning[~accessioning["specimen_type"].isin(SPECIMEN_TYPES)]
-        # if miss_st.shape[0]:
-        #     raise AirflowException(f"Incorrect Specimen Type (Accessioning): {' ,'.join(miss_st['inventory_code'])}")
-        # miss_of = accessioning[~accessioning["origination_facility"].isin(FACILITY_MAP.keys())]
-        # if miss_of.shape[0]:
-        #     raise AirflowException(f"Incorrect Origination Facility (Accessioning): {' ,'.join(miss_of['inventory_code'])}")
-        miss_stat = accessioning[~accessioning["status"].isin(STATUS_MAP.keys())]
-        if miss_stat.shape[0]:
-            raise AirflowException(
-                f"Incorrect Status (Accessioning): {' ,'.join(miss_stat['inventory_code'])}"
-            )
+    miss_stat = accessioning[~accessioning["status"].isin(STATUS_MAP.keys())]
+    if miss_stat.shape[0]:
         accessioning["randomization_id"] = accessioning.apply(
             lambda x: str(x["randomization_id"]).zfill(6)
             if x["randomization_id"]
             else None,
             axis=1,
         )
-        accessioning["screening_number"] = accessioning.apply(
-            lambda x: str(x["screening_number"]).zfill(9)
-            if x["screening_number"]
-            else None,
-            axis=1,
+    accessioning["screening_number"] = accessioning.apply(
+        lambda x: str(x["screening_number"]).zfill(9)
+        if x["screening_number"]
+        else None,
+        axis=1,
+    )
+
+    def check_site(inventory_code, site):
+        numeric_site = pd.to_numeric(site, errors="coerce")
+        try:
+            if not np.isnan(numeric_site):
+                return str(int(pd.to_numeric(site))).zfill(4)
+        except:
+            print("normal site", site)
+            print("numeric site", numeric_site)
+            print("inventory code", inventory_code)
+        return None
+
+    accessioning["site"] = accessioning.apply(
+        lambda x: check_site(x["inventory_code"], x["site"]), axis=1
+    )
+    accessioning["comments"] = accessioning.apply(
+        lambda x: str(x["comments"])[:250] if x["comments"] else None, axis=1
+    )
+    accessioning["status"] = accessioning["status"].replace(STATUS_MAP)
+    return accessioning
+
+
+def run_ali_validation(aliquot):
+    aliquot = aliquot[aliquot["container_type"] != "BloodSpotCard"]
+    aliquot = aliquot[
+        ~((aliquot["container_type"] == "Micronic 1.4") & (aliquot["source"] == "WB"))
+    ]
+    aliquot["specimen_type"] = aliquot["source"].replace(SOURCE_MAPPING)
+    aliquot["specimen_type"] = aliquot.apply(
+        lambda x: SPECIMEN_MAPPING[x["container_type"].lower()]
+        if x["source"] == "WB"
+        else x["specimen_type"],
+        axis=1,
+    )
+    miss_stat = aliquot[~aliquot["status"].isin(STATUS_MAP.keys())]
+    if miss_stat.shape[0]:
+        raise AirflowException(
+            f"Incorrect Status (Aliquot): {' ,'.join(miss_stat['inventory_code'])}"
         )
+    aliquot["status"] = aliquot["status"].replace(STATUS_MAP)
+    return aliquot
 
-        def check_site(inventory_code, site):
-            numeric_site = pd.to_numeric(site, errors="coerce")
-            try:
-                if not np.isnan(numeric_site):
-                    return str(int(pd.to_numeric(site))).zfill(4)
-            except:
-                print("normal site", site)
-                print("numeric site", numeric_site)
-                print("inventory code", inventory_code)
-                raise AirflowException("Site is not a number")
-            return None
 
-        # print(accessioning[["inventory_code", "site"]].head(5))
-        accessioning["site"] = accessioning.apply(
-            lambda x: check_site(x["inventory_code"], x["site"]), axis=1
-        )
-        accessioning["comments"] = accessioning.apply(
-            lambda x: str(x["comments"])[:250] if x["comments"] else None, axis=1
-        )
-        accessioning["status"] = accessioning["status"].replace(STATUS_MAP)
-        return accessioning
+def run_qc_validation(qc):
+    vol_unit_dict = {"ml": 1000, "mL": 1000, "uL": 1, "Unit": 10}
+    conc_unit_dict = {"ng/ul": 1}
 
-    def run_ali_validation(aliquot):
-        aliquot = aliquot[aliquot["container_type"] != "BloodSpotCard"]
-        aliquot = aliquot[
-            ~(
-                (aliquot["container_type"] == "Micronic 1.4")
-                & (aliquot["source"] == "WB")
-            )
-        ]
-        aliquot["specimen_type"] = aliquot["source"].replace(SOURCE_MAPPING)
-        aliquot["specimen_type"] = aliquot.apply(
-            lambda x: SPECIMEN_MAPPING[x["container_type"].lower()]
-            if x["source"] == "WB"
-            else x["specimen_type"],
-            axis=1,
-        )
-        miss_stat = aliquot[~aliquot["status"].isin(STATUS_MAP.keys())]
-        if miss_stat.shape[0]:
-            raise AirflowException(
-                f"Incorrect Status (Aliquot): {' ,'.join(miss_stat['inventory_code'])}"
-            )
-        aliquot["status"] = aliquot["status"].replace(STATUS_MAP)
-        return aliquot
+    def add_padding(number):
+        if number:
+            return f"{round(number, 3):.3f}"
+        return None
 
-    def run_qc_validation(qc):
-        vol_unit_dict = {"ml": 1000, "mL": 1000, "uL": 1, "Unit": 10}
-        conc_unit_dict = {"ng/ul": 1}
+    def validate_vol(vol_avg, vol_avg_unit, valid_dict):
+        if vol_avg is not None and vol_avg_unit is not None:
+            return vol_avg * valid_dict[vol_avg_unit]
+        elif vol_avg:
+            return vol_avg
+        return None
 
-        def add_padding(number):
-            if number:
-                return f"{round(number, 3):.3f}"
-            return None
+    def get_yield(vol, concentration):
+        if vol and concentration:
+            return vol * concentration / 1000
+        return None
 
-        def validate_vol(vol_avg, vol_avg_unit, valid_dict):
-            if vol_avg is not None and vol_avg_unit is not None:
-                return vol_avg * valid_dict[vol_avg_unit]
-            elif vol_avg:
-                return vol_avg
-            return None
+    qc = qc.fillna(np.nan).replace([np.nan], [None])
+    qc["vol_avg"] = qc.apply(
+        lambda x: validate_vol(x.vol_avg, x.volume_unit, vol_unit_dict), axis=1
+    )
+    qc["vol_avg"] = qc.apply(
+        lambda x: 0 if x.vol_avg < 0 else x.vol_avg, axis=1
+    ).replace([np.nan], [None])
+    qc.loc[~qc["vol_avg"].isnull(), "volume_unit"] = "uL"
+    qc.loc[~qc["concentration"].isnull(), "concentration_unit"] = "ng/ul"
+    qc["yield"] = qc.apply(
+        lambda x: get_yield(x.vol_avg, x.concentration), axis=1
+    ).replace([np.nan], [None])
+    qc["vol_avg"] = qc.apply(
+        lambda x: add_padding(x.vol_avg) if x.vol_avg else None, axis=1
+    ).replace([np.nan], [None])
+    qc["yield"] = qc.apply(
+        lambda x: add_padding(x["yield"]) if x["yield"] else None, axis=1
+    ).replace([np.nan], [None])
+    qc["concentration"] = qc.apply(
+        lambda x: add_padding(x.concentration) if x.concentration else None, axis=1
+    ).replace([np.nan], [None])
+    return qc
 
-        def get_yield(vol, concentration):
-            if vol and concentration:
-                return vol * concentration / 1000
-            return None
 
-        qc = qc.fillna(np.nan).replace([np.nan], [None])
-        qc["vol_avg"] = qc.apply(
-            lambda x: validate_vol(x.vol_avg, x.volume_unit, vol_unit_dict), axis=1
-        )
-        qc["vol_avg"] = qc.apply(
-            lambda x: 0 if x.vol_avg < 0 else x.vol_avg, axis=1
-        ).replace([np.nan], [None])
-        qc.loc[~qc["vol_avg"].isnull(), "volume_unit"] = "uL"
-        qc.loc[~qc["concentration"].isnull(), "concentration_unit"] = "ng/ul"
-        qc["yield"] = qc.apply(
-            lambda x: get_yield(x.vol_avg, x.concentration), axis=1
-        ).replace([np.nan], [None])
-        qc["vol_avg"] = qc.apply(
-            lambda x: add_padding(x.vol_avg) if x.vol_avg else None, axis=1
-        ).replace([np.nan], [None])
-        qc["yield"] = qc.apply(
-            lambda x: add_padding(x["yield"]) if x["yield"] else None, axis=1
-        ).replace([np.nan], [None])
-        qc["concentration"] = qc.apply(
-            lambda x: add_padding(x.concentration) if x.concentration else None, axis=1
-        ).replace([np.nan], [None])
-        return qc
+def run_su_validation(su):
+    su["site_name"] = su["site_name"].replace(FACILITY_MAP).replace([np.nan], [None])
+    # su = su[(su["site_name"].isnull()) | (su["site_name"].isin(FACILITY_MAP.keys()))] # Temporary Solution
+    # su["site_name"] = su.apply(lambda x: "TBD" if x["status"] == "Shipped" and x["site_name"] not in FACILITY_MAP.keys() else x["site_name"], axis = 1)
+    # su.loc[(su["status"] == "Shipped") & (su[~su["site_name"].isin(FACILITY_MAP.keys())]), "site_name"] = "TBD"
+    # miss_sn = su[(~su["site_name"].isin(FACILITY_MAP.keys())) & (su["status"] == "Shipped")]
+    # if miss_sn.shape[0]:
+    #     raise AirflowException(f"Incorrect Site Name (Status Updates): {' ,'.join(miss_sn['inventory_code'])}")
+    # configure dates depending on what the status is
+    # su["Shipped Date"] = su.apply(lambda x: x["date_updated"] if x["status"] == "Shipped" else None, axis = 1)
+    # su["Terminal Date"] = su.apply(lambda x: x["date_updated"] if x["status"] == "Disposed" else None, axis = 1)
+    return su.sort_values("date_updated").drop_duplicates(
+        subset=["inventory_code"], keep="last"
+    )
 
-    def run_su_validation(su):
-        su["site_name"] = (
-            su["site_name"].replace(FACILITY_MAP).replace([np.nan], [None])
-        )
-        # su = su[(su["site_name"].isnull()) | (su["site_name"].isin(FACILITY_MAP.keys()))] # Temporary Solution
-        # su["site_name"] = su.apply(lambda x: "TBD" if x["status"] == "Shipped" and x["site_name"] not in FACILITY_MAP.keys() else x["site_name"], axis = 1)
-        # su.loc[(su["status"] == "Shipped") & (su[~su["site_name"].isin(FACILITY_MAP.keys())]), "site_name"] = "TBD"
-        # miss_sn = su[(~su["site_name"].isin(FACILITY_MAP.keys())) & (su["status"] == "Shipped")]
-        # if miss_sn.shape[0]:
-        #     raise AirflowException(f"Incorrect Site Name (Status Updates): {' ,'.join(miss_sn['inventory_code'])}")
-        # configure dates depending on what the status is
-        # su["Shipped Date"] = su.apply(lambda x: x["date_updated"] if x["status"] == "Shipped" else None, axis = 1)
-        # su["Terminal Date"] = su.apply(lambda x: x["date_updated"] if x["status"] == "Disposed" else None, axis = 1)
-        return su.sort_values("date_updated").drop_duplicates(
-            subset=["inventory_code"], keep="last"
-        )
 
-    def unpack_meta(data):
-        # print("\n_____________________LIST DATA META___________________\n\n")
-        print(list(data["meta"]))
-        # print("\n_________________________________________\n")
-        meta_data = pd.DataFrame(list(data["meta"]))
-        return pd.concat([data.drop(columns=["meta"]), meta_data], axis=1).replace(
-            [np.nan], [None]
-        )
+def unpack_meta(data):
+    # print("\n_____________________LIST DATA META___________________\n\n")
+    print(list(data["meta"]))
+    # print("\n_________________________________________\n")
+    meta_data = pd.DataFrame(list(data["meta"]))
+    return pd.concat([data.drop(columns=["meta"]), meta_data], axis=1).replace(
+        [np.nan], [None]
+    )
 
-    @task()
-    def fetch_data():
-        # Step 1: Get Context for client and project
-        context = get_current_context()
-        tz = timezone("America/New_York")
-        start_time = context["execution_date"]
-        file_time = (
-            start_time.astimezone(tz=tz).replace(tzinfo=None).strftime("%Y%m%d_%H%M%S")
-        )
-        # If iterative file, need to check edits to fetch INV CODES edited within the last N days
-        print("VALIDATING ACCESSION:\n")
-        acc = run_acc_validation(
-            unpack_meta(
-                pd.read_sql(
-                    db.query(Accessioning)
-                    .filter(Accessioning.client == "MERCK")
-                    .statement,
-                    db.bind,
-                ).replace([np.nan], [None])
-            )
-        ).rename(columns=ACC_MAPPING)
-        print("DONE\n_________________________________________________\n")
-        print("VALIDATING ALIQUOT:\n")
-        ali = run_ali_validation(
-            unpack_meta(
-                pd.read_sql(
-                    db.query(Aliquot).filter(Aliquot.client == "MERCK").statement,
-                    db.bind,
-                ).replace([np.nan], [None])
-            )
-        ).rename(columns=ALI_MAPPING)
-        print("DONE\n_________________________________________________\n")
-        print("VALIDATING QUALITY CONTROL:\n")
-        qc = run_qc_validation(
-            unpack_meta(
-                pd.read_sql(
-                    db.query(QualityControl)
-                    .filter(QualityControl.client == "MERCK")
-                    .statement,
-                    db.bind,
-                ).replace([np.nan], [None])
-            )
-        ).rename(columns=QC_MAPPING)
-        print("DONE\n_________________________________________________\n")
-        print("VALIDATING STATUS UPDATE:\n")
-        su = run_su_validation(
+
+def fetch_data():
+    # Step 1: Get Context for client and project
+    context = get_current_context()
+    tz = timezone("America/New_York")
+    start_time = context["execution_date"]
+    file_time = (
+        start_time.astimezone(tz=tz).replace(tzinfo=None).strftime("%Y%m%d_%H%M%S")
+    )
+    # If iterative file, need to check edits to fetch INV CODES edited within the last N days
+    print("VALIDATING ACCESSION:\n")
+    acc = run_acc_validation(
+        unpack_meta(
             pd.read_sql(
-                db.query(StatusUpdates)
-                .filter(StatusUpdates.client == "MERCK")
+                db.query(Accessioning).filter(Accessioning.client == "MERCK").statement,
+                db.bind,
+            ).replace([np.nan], [None])
+        )
+    ).rename(columns=ACC_MAPPING)
+    print("DONE\n_________________________________________________\n")
+    print("VALIDATING ALIQUOT:\n")
+    ali = run_ali_validation(
+        unpack_meta(
+            pd.read_sql(
+                db.query(Aliquot).filter(Aliquot.client == "MERCK").statement,
+                db.bind,
+            ).replace([np.nan], [None])
+        )
+    ).rename(columns=ALI_MAPPING)
+    print("DONE\n_________________________________________________\n")
+    print("VALIDATING QUALITY CONTROL:\n")
+    qc = run_qc_validation(
+        unpack_meta(
+            pd.read_sql(
+                db.query(QualityControl)
+                .filter(QualityControl.client == "MERCK")
                 .statement,
                 db.bind,
             ).replace([np.nan], [None])
-        ).rename(columns=SU_MAPPING)
-        print("DONE SU validation and SU data is", su["Terminal Date"])
-        # send_data(f"su_df_{file_time}.csv", su)
-
-        # Join Tables Together
-        print("Testing Shape: ", acc.shape, ali.shape, qc.shape, su.shape)
-
-        print(
-            "\n\n---------------------------------------\nCONC1 = MERGE ALIQUOT AND QC\n\n"
         )
-        conc1 = ali.merge(qc, how="inner", on=["Specimen ID"], suffixes=("", "_qc"))
-        print("CONC 1: ", conc1.shape)
+    ).rename(columns=QC_MAPPING)
+    print("DONE\n_________________________________________________\n")
+    print("VALIDATING STATUS UPDATE:\n")
+    su = run_su_validation(
+        pd.read_sql(
+            db.query(StatusUpdates).filter(StatusUpdates.client == "MERCK").statement,
+            db.bind,
+        ).replace([np.nan], [None])
+    ).rename(columns=SU_MAPPING)
+    print("DONE SU validation and SU data is", su["Terminal Date"])
+    # send_data(f"su_df_{file_time}.csv", su)
 
-        conc2 = conc1.merge(
-            acc,
-            how="inner",
-            left_on=["ultimate_parent"],
-            right_on=["Specimen ID"],
-            suffixes=("", "_acc"),
+    # Join Tables Together
+    print("Testing Shape: ", acc.shape, ali.shape, qc.shape, su.shape)
+
+    print(
+        "\n\n---------------------------------------\nCONC1 = MERGE ALIQUOT AND QC\n\n"
+    )
+    conc1 = ali.merge(qc, how="inner", on=["Specimen ID"], suffixes=("", "_qc"))
+    print("CONC 1: ", conc1.shape)
+
+    conc2 = conc1.merge(
+        acc,
+        how="inner",
+        left_on=["ultimate_parent"],
+        right_on=["Specimen ID"],
+        suffixes=("", "_acc"),
+    )
+    print("CONC 2: ", conc2.shape)
+
+    conc3 = pd.concat([conc2, acc], ignore_index=True, sort=False)
+    print("CONC 3: ", conc3.shape)
+
+    export = conc3
+    export = export.merge(
+        su, how="left", on=["Specimen ID", "Current Status"], suffixes=("", "_su")
+    )
+    print("*****----ZZ")
+    print(export[export["Specimen ID"] == "8013398046"])
+    print(su[su["Specimen ID"] == "8013398046"])
+    print("*****----ZZ")
+
+    # export = export.merge(su, how = "left", on = ["Specimen ID"], suffixes = ('', '_su'))
+
+    print("EXPORT : ", export.columns)
+
+    # print("\n\nWriting ACC to CSV\n")
+    # send_data(f"Acc_df_{file_time}.csv", acc)
+    print("\n\nWriting ALI to CSV\n")
+    # send_data(f"ali_df_{file_time}.csv", ali)
+    print("\n\nWriting QC to CSV\n")
+    # send_data(f"qc_df_{file_time}.csv", qc)
+    print("\n\nWriting SU to CSV\n")
+    # send_data(f"su_df_{file_time}.csv", su)
+    print("\n\nWriting CONC1 ALI+QC to CSV\n")
+    # send_data(f"conc1_df_{file_time}.csv", conc1)
+    print("\n\nWriting CONC2 ALI+QC+ACC to CSV\n")
+    # send_data(f"conc2_df_{file_time}.csv", conc2)
+    print("\n\nWriting CONC3 ALI+QC+ACC+ACC to CSV\n")
+    # send_data(f"conc3_df_{file_time}.csv", conc3)
+    # print("\n\nWriting EXPORT ALI+QC+ACC+ACC+SU to CSV\n")
+    # send_data(f"export_df_{file_time}.csv", export)
+
+    print("Testing Shape after joins: ", export.shape)
+    export = export.rename(MAPPING)
+    export = export[[col for col in ALL_COLUMNS if col in export.columns]]
+    export = export.replace([np.nan], [None])
+
+    # Here we will format the dates
+    date_columns = [
+        "Collection Date",
+        "Terminal Date",
+        "Shipped Date",
+        "Created Date",
+        "Received Date",
+    ]
+    for col in date_columns:
+        export[col] = pd.to_datetime(export[col], errors="coerce").dt.strftime(
+            "%m/%d/%Y"
         )
-        print("CONC 2: ", conc2.shape)
+    export["Collection Time"] = pd.to_datetime(
+        export["Collection Time"], errors="coerce"
+    ).dt.strftime("%H:%M")
+    export = export.fillna(np.nan).replace([np.nan], [None])
 
-        conc3 = pd.concat([conc2, acc], ignore_index=True, sort=False)
-        print("CONC 3: ", conc3.shape)
+    # print("\n\nWriting EXPORT AFTER REFORMAT to CSV\n")
+    # send_data(f"export2_df_{file_time}.csv", export)
 
-        export = conc3
-        export = export.merge(
-            su, how="left", on=["Specimen ID", "Current Status"], suffixes=("", "_su")
-        )
-        print("*****----ZZ")
-        print(export[export["Specimen ID"] == "8013398046"])
-        print(su[su["Specimen ID"] == "8013398046"])
-        print("*****----ZZ")
-        send_data(f"export_df_{file_time}.csv", export)
-        send_data(f"su_df_{file_time}.csv", su)
-        # export = export.merge(su, how = "left", on = ["Specimen ID"], suffixes = ('', '_su'))
-        send_data(f"export_su_df_{file_time}.csv", export)
+    export["Vendor"] = "IBX"
+    export["Assay"] = ""
+    export["Biopsy Accession ID"] = ""
+    export["Biopsy Anatomic Location"] = ""
+    export["Biopsy Collection Method"] = ""
+    export["Fixation Method"] = ""
+    export["Lesion Type"] = ""
+    export["Pre/Post Treatment"] = ""
+    export["Slide Thickness"] = ""
+    export["Slides Sectioned Date"] = ""
+    export["Specimen Fixation Date"] = ""
+    export["Specimen Tissue Category"] = ""
+    export["Diagnosis Confirmed"] = ""
+    export["Biopsy Lesion Injection Status"] = ""
+    export["Time from Tissue Excision to Immersion in Fixative"] = ""
+    export["Fixation Time"] = ""
+    export["Institutional Block or Slide ID"] = ""
+    export["Time Specimen Placed in Fixative"] = ""
+    export["Number of Slides Submitted"] = ""
+    export["Type of Biopsy Sample Taken"] = ""
+    export["Vendor Specimen ID"] = ""
+    print("===========", export["Vendor Specimen ID"])
+    export.fillna("")
 
-        print("EXPORT : ", export.columns)
+    # File #1: MAIN
+    main_export = export[~export["Study Number"].isin(P3_STUDY)]
+    main_inv_export = export[export["Current Status"] == "In Inventory"]
+    main_inv_export_nonp3 = main_inv_export[
+        ~main_inv_export["Study Number"].isin(P3_STUDY)
+    ]
+    main_uninvexport = export[export["Current Status"] != "In Inventory"]
+    main_uninvexport_nonp3 = main_uninvexport[
+        ~main_uninvexport["Study Number"].isin(P3_STUDY)
+    ]
+    # send_data(f"BioTRACS_Merck_INV_Sampled_{file_time}.csv", main_inv_export)
 
-        # print("\n\nWriting ACC to CSV\n")
-        # send_data(f"Acc_df_{file_time}.csv", acc)
-        print("\n\nWriting ALI to CSV\n")
-        # send_data(f"ali_df_{file_time}.csv", ali)
-        print("\n\nWriting QC to CSV\n")
-        # send_data(f"qc_df_{file_time}.csv", qc)
-        print("\n\nWriting SU to CSV\n")
-        # send_data(f"su_df_{file_time}.csv", su)
-        print("\n\nWriting CONC1 ALI+QC to CSV\n")
-        # send_data(f"conc1_df_{file_time}.csv", conc1)
-        print("\n\nWriting CONC2 ALI+QC+ACC to CSV\n")
-        # send_data(f"conc2_df_{file_time}.csv", conc2)
-        print("\n\nWriting CONC3 ALI+QC+ACC+ACC to CSV\n")
-        # send_data(f"conc3_df_{file_time}.csv", conc3)
-        # print("\n\nWriting EXPORT ALI+QC+ACC+ACC+SU to CSV\n")
-        # send_data(f"export_df_{file_time}.csv", export)
+    # send_data(f"BioTRACS_Merck_NINV_Sampled_{file_time}.csv", main_uninvexport)
 
-        print("Testing Shape after joins: ", export.shape)
-        export = export.rename(MAPPING)
-        export = export[[col for col in ALL_COLUMNS if col in export.columns]]
-        export = export.replace([np.nan], [None])
+    p3_export = export[export["Study Number"].isin(P3_STUDY)]
+    p3_inv_export = p3_export[p3_export["Current Status"] == "In Inventory"]
+    # p3_inv_export = export[export["Current Status"]=="In Inventory"]
+    p3_uninv_export = p3_export[p3_export["Current Status"] != "In Inventory"]
+    # p3_uninv_export = export[export["Current Status"]!="In Inventory"]
 
-        # Here we will format the dates
-        date_columns = [
-            "Collection Date",
-            "Terminal Date",
-            "Shipped Date",
-            "Created Date",
-            "Received Date",
-        ]
-        for col in date_columns:
-            export[col] = pd.to_datetime(export[col], errors="coerce").dt.strftime(
-                "%m/%d/%Y"
-            )
-        export["Collection Time"] = pd.to_datetime(
-            export["Collection Time"], errors="coerce"
-        ).dt.strftime("%H:%M")
-        export = export.fillna(np.nan).replace([np.nan], [None])
-
-        # print("\n\nWriting EXPORT AFTER REFORMAT to CSV\n")
-        # send_data(f"export2_df_{file_time}.csv", export)
-
-        export["Vendor"] = "IBX"
-        export["Assay"] = ""
-        export["Biopsy Accession ID"] = ""
-        export["Biopsy Anatomic Location"] = ""
-        export["Biopsy Collection Method"] = ""
-        export["Fixation Method"] = ""
-        export["Lesion Type"] = ""
-        export["Pre/Post Treatment"] = ""
-        export["Slide Thickness"] = ""
-        export["Slides Sectioned Date"] = ""
-        export["Specimen Fixation Date"] = ""
-        export["Specimen Tissue Category"] = ""
-        export["Diagnosis Confirmed"] = ""
-        export["Biopsy Lesion Injection Status"] = ""
-        export["Time from Tissue Excision to Immersion in Fixative"] = ""
-        export["Fixation Time"] = ""
-        export["Institutional Block or Slide ID"] = ""
-        export["Time Specimen Placed in Fixative"] = ""
-        export["Number of Slides Submitted"] = ""
-        export["Type of Biopsy Sample Taken"] = ""
-        export["Vendor Specimen ID"] = ""
-        print("===========", export["Vendor Specimen ID"])
-        export.fillna("")
-
-        # File #1: MAIN
-        main_export = export[~export["Study Number"].isin(P3_STUDY)]
-        main_inv_export = export[export["Current Status"] == "In Inventory"]
-        main_inv_export_nonp3 = main_inv_export[
-            ~main_inv_export["Study Number"].isin(P3_STUDY)
-        ]
-        main_uninvexport = export[export["Current Status"] != "In Inventory"]
-        main_uninvexport_nonp3 = main_uninvexport[
-            ~main_uninvexport["Study Number"].isin(P3_STUDY)
-        ]
-        # send_data(f"BioTRACS_Merck_INV_Sampled_{file_time}.csv", main_inv_export)
-        send_data(f"BioTRACS_Merck_INV_Sampled_{file_time}.csv", main_inv_export_nonp3)
-        # send_data(f"BioTRACS_Merck_NINV_Sampled_{file_time}.csv", main_uninvexport)
-        send_data(
-            f"BioTRACS_Merck_NINV_Sampled_{file_time}.csv", main_uninvexport_nonp3
-        )
-        p3_export = export[export["Study Number"].isin(P3_STUDY)]
-        p3_inv_export = p3_export[p3_export["Current Status"] == "In Inventory"]
-        # p3_inv_export = export[export["Current Status"]=="In Inventory"]
-        p3_uninv_export = p3_export[p3_export["Current Status"] != "In Inventory"]
-        # p3_uninv_export = export[export["Current Status"]!="In Inventory"]
-        send_data(f"BioTRACS_Merck_INV_Sampled_P3_{file_time}.csv", p3_inv_export)
-        send_data(f"BioTRACS_Merck_NINV_Sampled_P3_{file_time}.csv", p3_uninv_export)
-        # main_export = export[~export["Study Number"].isin(P3_STUDY)]
-        # p3_export = export[export["Study Number"].isin(P3_STUDY)]
-        # send_data(f"BioTRACS_Merck_INV_Sampled_{file_time}.csv", main_export)
-        # send_data(f"BioTRACS_Merck_INV_Sampled_P3_{file_time}.csv", p3_export)
-        return True
-
-    fetch_data()
+    # main_export = export[~export["Study Number"].isin(P3_STUDY)]
+    # p3_export = export[export["Study Number"].isin(P3_STUDY)]
+    # send_data(f"BioTRACS_Merck_INV_Sampled_{file_time}.csv", main_export)
+    # send_data(f"BioTRACS_Merck_INV_Sampled_P3_{file_time}.csv", p3_export)
+    return True
 
 
-etl = sphere_merck_data_feed_new()
+fetch_data()
